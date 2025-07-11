@@ -21,3 +21,14 @@ cd portugalWildFires
 python -m venv venv
 source venv/Scripts/activate
 pip install -r requirements.txt
+
+## 📦 Usage
+
+# Download FIRMS fire data from Kaggle
+python scripts/download_kaggle_firms.py
+
+# Filter for Portugal
+python scripts/filter_portugal_fires.py
+
+# Generate map
+python scripts/map_portugal_fires.py
