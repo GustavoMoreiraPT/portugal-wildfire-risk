@@ -1,72 +1,62 @@
-import xarray as xr
 import pandas as pd
-import numpy as np
-import os
-from datetime import datetime
+import xarray as xr
 from tqdm import tqdm
 
-# === Load all ERA5 files ===
-era5_folder = "data/era5"
-nc_files = sorted([f for f in os.listdir(era5_folder) if f.endswith(".nc")])
+# --- Load ERA5 data ---
+print("📂 Loading ERA5 data from: data/era5")
+era5_files = [f"data/era5/era5_temperature_2023_{month:02d}.nc" for month in range(1, 13)]
+ds_list = [xr.open_dataset(f) for f in era5_files]
+ds = xr.concat(ds_list, dim="time")
 
-# === Load fire data ===
+# Flatten t2m using valid_time
+t2m = ds["t2m"] - 273.15  # Convert Kelvin to Celsius
+valid_times = ds["valid_time"].values
+
+print("✅ ERA5 dataset merged.")
+print(f"📊 ERA5 time range:\n{pd.to_datetime(valid_times[0])} → {pd.to_datetime(valid_times[-1])}")
+print(f"📍 Grid: lat {ds.latitude.min().item()} → {ds.latitude.max().item()}, lon {ds.longitude.min().item()} → {ds.longitude.max().item()}")
+
+# --- Load fire data ---
 fires = pd.read_csv("data/portugal_fires.csv")
-fires["acq_time"] = fires["acq_time"].apply(lambda x: f"{int(x):04d}")
 fires["datetime"] = pd.to_datetime(
-    fires["acq_date"] + fires["acq_time"], format="%Y-%m%d%H%M", errors='coerce'
+    fires["acq_date"].astype(str) + " " + fires["acq_time"].astype(str).str.zfill(4),
+    format="%Y-%m-%d %H%M",
+    errors="coerce"
 )
-fires["datetime_hour"] = fires["datetime"].dt.floor("H")
+fires["datetime_hour"] = fires["datetime"].dt.floor("h")
+fires["lat_rounded"] = fires["latitude"].round(2)
+fires["lon_rounded"] = fires["longitude"].round(2)
+fire_keys = set(zip(fires["datetime_hour"], fires["lat_rounded"], fires["lon_rounded"]))
 
-# Round lat/lon to ERA5 grid resolution
-def round_coord(val, resolution=0.25):
-    return round(val / resolution) * resolution
+print("🕒 Sample fire datetimes and coords:")
+print(fires[["datetime_hour", "lat_rounded", "lon_rounded"]].dropna().head())
 
-fires["lat_rounded"] = fires["latitude"].apply(round_coord)
-fires["lon_rounded"] = fires["longitude"].apply(round_coord)
+# --- Generate training samples ---
+print("\n📦 Generating labeled fire/no-fire samples from ERA5 data...")
 
-# Build a lookup set for quick fire detection
-fire_set = set(zip(fires["datetime_hour"], fires["lat_rounded"], fires["lon_rounded"]))
+records = []
+latitudes = ds["latitude"].values
+longitudes = ds["longitude"].values
 
-# === Process all ERA5 files ===
-samples = []
+# Determine shape and flatten t2m to align with valid_time
+flat_t2m = t2m.stack(valid_time_flat=("time", "valid_time"))
 
-print("📦 Generating labeled fire/no-fire samples from ERA5 data...")
-
-for nc_file in tqdm(nc_files):
-    path = os.path.join(era5_folder, nc_file)
+for i, timestamp in enumerate(tqdm(valid_times, desc="🕐 Processing hours")):
+    # Get temperature slice for this timestamp
     try:
-        ds = xr.open_dataset(path)
+        temp_data = flat_t2m.sel(valid_time=timestamp)
+    except KeyError:
+        continue  # In case the timestamp isn't found, skip
 
-        # Determine time coordinate key
-        time_coord = "valid_time" if "valid_time" in ds.coords else "time"
+    df_temp = temp_data.to_dataframe(name="temperature").reset_index()
+    df_temp["datetime_hour"] = pd.to_datetime(timestamp)
+    df_temp["lat_rounded"] = df_temp["latitude"].round(2)
+    df_temp["lon_rounded"] = df_temp["longitude"].round(2)
+    df_temp["key"] = list(zip(df_temp["datetime_hour"], df_temp["lat_rounded"], df_temp["lon_rounded"]))
+    df_temp["fire_occurred"] = df_temp["key"].isin(fire_keys).astype(int)
+    records.append(df_temp[["datetime_hour", "lat_rounded", "lon_rounded", "temperature", "fire_occurred"]])
 
-        for t in ds[time_coord].values:
-            time = pd.to_datetime(str(t))
-            for lat in ds.latitude.values:
-                for lon in ds.longitude.values:
-                    rounded = (time, round_coord(lat), round_coord(lon))
-                    fire_label = 1 if rounded in fire_set else 0
-
-                    # Extract weather features
-                    point = ds.sel({time_coord: time, "latitude": lat, "longitude": lon}, method="nearest")
-                    temp_c = float(point["t2m"].values) - 273.15
-                    wind_u = float(point["u10"].values)
-                    wind_v = float(point["v10"].values)
-                    wind_speed = np.sqrt(wind_u**2 + wind_v**2)
-
-                    samples.append({
-                        "datetime": time,
-                        "latitude": lat,
-                        "longitude": lon,
-                        "temp_c": temp_c,
-                        "wind_speed": wind_speed,
-                        "fire_occurred": fire_label
-                    })
-
-    except Exception as e:
-        print(f"⚠️ Failed to process {nc_file}: {e}")
-
-# Save dataset
-df = pd.DataFrame(samples)
-df.to_csv("data/fire_risk_training_data.csv", index=False)
-print("✅ Done! Saved to data/fire_risk_training_data.csv")
+# Combine and save
+df_all = pd.concat(records, ignore_index=True)
+df_all.to_csv("data/fire_risk_training_data.csv", index=False)
+print("✅ Saved training data to: data/fire_risk_training_data.csv")
